@@ -1,0 +1,201 @@
+#!/bin/bash
+
+set -x
+
+set -eo pipefail
+
+# If WordPress has not been installed yet, unpack it.
+
+if [ ! -f wp-config-sample.php ]; then
+    tar --strip-components=1 -xzf /opt/app-root/downloads/wordpress.tar.gz
+
+    # Edit the wp-config-sample.php to allow plugins and themes to be
+    # installed directly into file system.
+
+    sed -i "/'DB_COLLATE', *'');/a\
+    define('FS_METHOD', 'direct');" wp-config-sample.php
+
+    # Edit the wp-config-sample.php to force use of a secure connection
+    # for login and adminstration.
+
+    sed -i "/'DB_COLLATE', .*;/a\
+    define( 'FORCE_SSL_ADMIN', true );" wp-config-sample.php
+
+    # Edit the wp-config-sample.php to ensure that static files are served
+    # up over same protocol as request to avoid mixed content errors.
+
+    # Force SSL
+    sed -i "/'DB_COLLATE', .*;/a\
+    \$_SERVER['HTTPS']='on';" wp-config-sample.php
+fi
+
+# Check whether the wp-config.php file has been generated previously. If
+# not then we need to generate it. This is placed in the persistent volume.
+
+secret() {
+    php -r'echo bin2hex(openssl_random_pseudo_bytes(32));'
+}
+
+if [ ! -f wp-config.php ]; then
+    TMPCONFIG=/tmp/wp-config-temp.php
+    cp wp-config-sample.php $TMPCONFIG
+
+    sed -i "s/'DB_NAME', *'database_name_here'/'DB_NAME', '$MYSQL_DATABASE'/" $TMPCONFIG
+    sed -i "s/'DB_USER', *'username_here'/'DB_USER', '$MYSQL_USER'/" $TMPCONFIG
+    sed -i "s/'DB_PASSWORD', *'password_here'/'DB_PASSWORD', '$MYSQL_PASSWORD'/" $TMPCONFIG
+    sed -i "s/'DB_HOST', *'localhost'/'DB_HOST', '$MYSQL_HOST'/" $TMPCONFIG
+    sed -i "s/\$table_prefix *= *'wp_';/\$table_prefix = '$MYSQL_TABLE_PREFIX';/" $TMPCONFIG
+
+    sed -i "s/'AUTH_KEY', *'put your unique phrase here'/'AUTH_KEY', '`secret`'/" $TMPCONFIG
+    sed -i "s/'SECURE_AUTH_KEY', *'put your unique phrase here'/'SECURE_AUTH_KEY', '`secret`'/" $TMPCONFIG
+    sed -i "s/'LOGGED_IN_KEY', *'put your unique phrase here'/'LOGGED_IN_KEY', '`secret`'/" $TMPCONFIG
+    sed -i "s/'NONCE_KEY', *'put your unique phrase here'/'NONCE_KEY', '`secret`'/" $TMPCONFIG
+    sed -i "s/'AUTH_SALT', *'put your unique phrase here'/'AUTH_SALT', '`secret`'/" $TMPCONFIG
+    sed -i "s/'SECURE_AUTH_SALT', *'put your unique phrase here'/'SECURE_AUTH_SALT', '`secret`'/" $TMPCONFIG
+    sed -i "s/'LOGGED_IN_SALT', *'put your unique phrase here'/'LOGGED_IN_SALT', '`secret`'/" $TMPCONFIG
+    sed -i "s/'NONCE_SALT', *'put your unique phrase here'/'NONCE_SALT', '`secret`'/" $TMPCONFIG
+
+    mv $TMPCONFIG wp-config.php
+
+    NS=`cat /run/secrets/kubernetes.io/serviceaccount/namespace`
+
+    URL=${PUBLIC_URL:-$APPLICATION_NAME-$NS.$SUFFIX}
+
+    # Variables d'environnement à appliquer depuis un secret si nécessaire
+    SMTP_HOST=${SMTP_HOST:-super}
+    SMTP_PORT=${SMTP_PORT:-25}
+    SMTP_AUTH=${SMTP_AUTH:-false}
+    SMTP_ENCRYPTION=${SMTP_ENCRYPTION:-none}
+    SMTP_USER=${SMTP_USERNAME:-}
+    SMTP_PASS=`echo -n $SMTP_PASSWORD|base64`
+
+    wp core install --url=${URL} --title=${APPLICATION_NAME} --admin_name=${WP_ADMIN} --admin_password=${WP_PASSWORD} --admin_email=${WP_EMAIL}
+    cd wp-content
+    wp plugin delete hello
+    wp plugin auto-updates enable akismet
+
+    wp plugin install backwpup --activate
+    wp plugin auto-updates enable backwpup
+
+    # commande pour créer le job
+    wp option update backwpup_jobs '{"1":{"jobid":1,"backuptype":"archive","type":["DBDUMP","FILE","WPPLUGIN"],"destinations":["FOLDER"],"name":"daily-backup-job","mailaddresslog":"'${WP_EMAIL}'","mailaddresssenderlog":"BackWPup '${URL}'<'${WP_EMAIL}'>","mailerroronly":true,"archiveformat":".zip","archiveencryption":false,"archivename":"%Y-%m-%d_%H-%i-%s_%hash%","fileexclude":".DS_Store,.git,.svn,.tmp,/node_modules/,desktop.ini","dirinclude":"","backupexcludethumbs":false,"backupspecialfiles":true,"backuproot":true,"backupabsfolderup":false,"backupcontent":true,"backupplugins":true,"backupthemes":true,"backupuploads":true,"backuprootexcludedirs":[],"backupcontentexcludedirs":["upgrade"],"backuppluginsexcludedirs":[],"backupthemesexcludedirs":[],"backupuploadsexcludedirs":[],"backupdir":"uploads/backwpup/daily-backup/","maxbackups":15,"backupsyncnodelete":false,"activetype":"wpcron","cronselect":"basic","cron":"0 3 * * *"}}' --json
+
+    # commande pour appliquer les options du job
+    wp cron event run backwpup_check_cleanup
+
+    # creer un lien symbolique vers le point de montage du PVC de backup
+    ln -s /opt/app-root/backwpup /opt/app-root/src/wp-content/uploads
+    mkdir -p /opt/app-root/backwpup/daily-backup
+
+    # smtp-mailer
+    wp plugin install smtp-mailer --activate
+    wp plugin auto-updates enable smtp-mailer
+    wp option update smtp_mailer_options '{"smtp_host":"'${SMTP_HOST}'","smtp_auth":"'${SMTP_AUTH}'","smtp_username":"'${SMTP_USER}'","smtp_password":"'${SMTP_PASS}'","type_of_encryption":"'${SMTP_ENCRYPTION}'","smtp_port":"'${SMTP_PORT}'","from_email":"'${WP_EMAIL}'","from_name":"FROM '${WP_ADMIN}'","force_from_address":"","disable_ssl_verification":""}' --json
+
+fi
+
+# Copy user provided plugins, themes, language files and configuration
+# files into the persistent volume. This happens every time the image is
+# started, which is not ideal. If application is scaled, then could also
+# occur from multple replicas at the same time. No obvious way to avoid
+# that, so outstanding question as to whether that will cause any issues.
+
+if [ -d /opt/app-root/downloads/plugins ]; then
+    cp -rf /opt/app-root/downloads/plugins/* wp-content/plugins/ 2>/dev/null || true
+fi
+
+if [ -d /opt/app-root/downloads/themes ]; then
+    cp -rf /opt/app-root/downloads/themes/* wp-content/themes/ 2>/dev/null || true
+fi
+
+if [ -d /opt/app-root/downloads/languages ]; then
+    cp -rf /opt/app-root/downloads/languages/* wp-content/languages/ 2>/dev/null || true
+fi
+
+if [ -f /opt/app-root/downloads/configs/wp-config.php ]; then
+    cp -f /opt/app-root/downloads/configs/wp-config.php wp-config.php
+fi
+
+if [ -f /opt/app-root/downloads/configs/.htaccess ]; then
+    cp -f /opt/app-root/downloads/configs/.htaccess .htaccess
+fi
+
+# Enable WebDav access if authentication realm set and user database exists.
+
+if [ x"$WEBDAV_AUTHENTICATION_REALM" != x"" ]; then
+    if [ -f /opt/app-root/secrets/webdav/.htdigest ]; then
+        cat > /opt/app-root/etc/conf.d/90-webdav.conf << !
+<IfModule !dav_module>
+LoadModule dav_module modules/mod_dav.so'
+</IfModule>
+
+<IfModule !dav_fs_module>
+LoadModule dav_fs_module modules/mod_dav_fs.so'
+</IfModule>
+
+<IfModule !auth_digest_module>
+LoadModule auth_digest_module modules/mod_auth_digest.so'
+</IfModule>
+
+<IfModule !authn_file_module>
+LoadModule authn_file_module modules/mod_authn_file.so'
+</IfModule>
+
+<IfModule !authz_user_module>
+LoadModule authz_user_module modules/mod_authz_user.so'
+</IfModule>
+
+DavLockDB /opt/app-root/DavLock
+
+Alias "/webdav" "/opt/app-root/src"
+
+# bug 502 move
+<IfModule !headers_module>
+  LoadModule headers_module modules/mod_headers.so
+</IfModule>
+RequestHeader edit Destination ^https http early
+
+# The following directives disable redirects on non-GET requests for
+# a directory that does not include the trailing slash.  This fixes a
+# problem with several clients that do not appropriately handle
+# redirects for folders with DAV methods.
+#
+BrowserMatch "Microsoft Data Access Internet Publishing Provider" redirect-carefully
+BrowserMatch "MS FrontPage" redirect-carefully
+BrowserMatch "^Microsoft-WebDAV-MiniRedir" redirect-carefully
+BrowserMatch "^WebDrive" redirect-carefully
+BrowserMatch "^WebDAVFS/1.[0123]" redirect-carefully
+BrowserMatch "^gnome-vfs/1.0" redirect-carefully
+BrowserMatch "^gvfs" redirect-carefully
+BrowserMatch "^XML Spy" redirect-carefully
+BrowserMatch "^Dreamweaver-WebDAV-SCM1" redirect-carefully
+
+<Location "/webdav">
+    DAV on
+
+    SetHandler !
+    #ForceType text/plain
+    #DirectoryIndex disabled
+
+    AuthType Digest
+    AuthName "$WEBDAV_AUTHENTICATION_REALM"
+    AuthDigestDomain /webdav/
+    AuthDigestProvider file
+    AuthUserFile /opt/app-root/secrets/webdav/.htdigest
+
+    Require valid-user
+
+    # Propfind avec DirectoryIndex bug sur Finder Mac en DAV :
+    <Limit PROPFIND>
+      DirectoryIndex never-encounterable-file-name.html
+    </Limit>
+
+    RewriteEngine off
+</Location>
+!
+    fi
+fi
+
+# Execute the original run script, replacing this script as current process.
+
+exec /usr/libexec/s2i/run
