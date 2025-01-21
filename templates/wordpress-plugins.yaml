@@ -42,7 +42,7 @@ objects:
         name: ${APPLICATION_NAME}-img:latest
     source:
       git:
-        uri: https://plmlab.math.cnrs.fr/plmshift/wordpress.git
+        uri: https://github.com/rtweed/wp.git
       type: Git
     strategy:
       sourceStrategy:
