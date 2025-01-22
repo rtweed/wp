@@ -342,7 +342,7 @@ parameters:
   value: ReadWriteOnce
 - description: Storage class for persistent storage (leave for default)
   name: VOLUME_CLASS
-  value: ceph-block
+  value: nfs-provisioner
 - description: Type of the deployment strategy for Wordpress.
   name: WORDPRESS_DEPLOYMENT_STRATEGY
   required: true
