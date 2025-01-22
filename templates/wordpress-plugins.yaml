@@ -6,7 +6,7 @@ metadata:
       Requires that two persistent volumes be available. If a ReadWriteMany persistent
       volume type is available and used, WordPress can be scaled to multiple replicas
       and the deployment strategy switched to Rolling to permit rolling deployments
-      on restarts.
+      on restarts
     iconClass: icon-php
     openshift.io/display-name: WordPress (with default plugins)
     tags: quickstart,php,wordpress
